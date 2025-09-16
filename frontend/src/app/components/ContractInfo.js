@@ -264,7 +264,7 @@ const ContractInfo = ({ contract, connectedAccount, isReadOnly = false }) => {
           <button
             onClick={() =>
               window.open(
-                `https://etherscan.io/address/${contractData.contractAddress}`,
+                `https://sepolia.etherscan.io/address/${contractData.contractAddress}`,
                 "_blank"
               )
             }
