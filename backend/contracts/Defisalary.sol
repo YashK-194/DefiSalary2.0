@@ -13,11 +13,15 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         uint salaryUSD;
         uint joiningDate;
         uint lastPaymentDate;
+        uint nextPaymentDate;
         uint id;
     }
 
     AggregatorV3Interface public priceFeed;
     Employee[] public employees;
+
+    uint public constant PAY_INTERVAL = 30 days;
+    uint public constant MAX_BATCH_SIZE = 10;
 
     event EmployeeAdded(
         uint indexed id,
@@ -45,14 +49,13 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
 
     constructor(address _priceFeedAddress) Ownable(msg.sender) {
         priceFeed = AggregatorV3Interface(_priceFeedAddress);
-        // 0x694AA1769357215DE4FAC081bf1f309aDC325306
     }
 
     receive() external payable {}
-
     fallback() external payable {}
 
-    // Admin functions
+    // ================= ADMIN =================
+
     function addEmployee(
         string memory _name,
         address _walletAdd,
@@ -64,29 +67,30 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
             "Invalid Address"
         );
 
-        Employee memory newEmployee = Employee(
-            _name,
-            _walletAdd,
-            true,
-            _salaryUSD,
-            block.timestamp,
-            block.timestamp,
-            employees.length
-        );
+        uint id = employees.length;
+
+        Employee memory newEmployee = Employee({
+            name: _name,
+            walletAdd: _walletAdd,
+            isActive: true,
+            salaryUSD: _salaryUSD,
+            joiningDate: block.timestamp,
+            lastPaymentDate: block.timestamp,
+            nextPaymentDate: block.timestamp + PAY_INTERVAL,
+            id: id
+        });
+
         employees.push(newEmployee);
-        emit EmployeeAdded(employees.length - 1, _name, _walletAdd, _salaryUSD);
-        return employees.length - 1;
+
+        emit EmployeeAdded(id, _name, _walletAdd, _salaryUSD);
+        return id;
     }
 
     function removeEmployee(uint _id) external onlyOwner {
-        require(_id < employees.length, "Id not valid");
-        require(
-            employees[_id].isActive == true,
-            "Employee is already inactive"
-        );
+        require(_id < employees.length, "Invalid ID");
+        require(employees[_id].isActive, "Already inactive");
 
-        Employee storage employee = employees[_id];
-        employee.isActive = false;
+        employees[_id].isActive = false;
         emit EmployeeRemoved(_id);
     }
 
@@ -97,7 +101,7 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         uint _newSalaryUSD,
         uint _id
     ) external onlyOwner {
-        require(_id < employees.length, "Id not valid");
+        require(_id < employees.length, "Invalid ID");
         require(bytes(_newName).length > 0, "Name cannot be empty");
         require(
             _newWallet != address(0) && _newWallet != address(this),
@@ -109,6 +113,7 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         employee.walletAdd = _newWallet;
         employee.isActive = _isActive;
         employee.salaryUSD = _newSalaryUSD;
+
         emit EmployeeUpdated(
             _id,
             _newName,
@@ -124,10 +129,13 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
 
     function withdrawFunds() external onlyOwner {
         uint balance = address(this).balance;
-        require(balance > 0, "No funds to withdraw");
+        require(balance > 0, "No funds");
+
         (bool success, ) = payable(owner()).call{value: balance}("");
         require(success, "Withdraw failed");
     }
+
+    // ================= AUTOMATION =================
 
     function checkUpkeep(
         bytes memory
@@ -137,13 +145,13 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         override
         returns (bool upkeepNeeded, bytes memory performData)
     {
-        uint[] memory dueEmployees = new uint[](employees.length);
+        uint[] memory dueEmployees = new uint[](MAX_BATCH_SIZE);
         uint count = 0;
 
-        for (uint i = 0; i < employees.length; i++) {
+        for (uint i = 0; i < employees.length && count < MAX_BATCH_SIZE; i++) {
             if (
                 employees[i].isActive &&
-                block.timestamp - employees[i].lastPaymentDate >= 30 days
+                block.timestamp >= employees[i].nextPaymentDate
             ) {
                 dueEmployees[count] = i;
                 count++;
@@ -151,10 +159,9 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         }
 
         if (count > 0) {
-            upkeepNeeded = true;
-            bytes memory ids = abi.encode(dueEmployees, count);
-            return (true, ids);
+            return (true, abi.encode(dueEmployees, count));
         }
+
         return (false, "");
     }
 
@@ -163,25 +170,30 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
             performData,
             (uint[], uint)
         );
+
         for (uint i = 0; i < count; i++) {
-            paySalary(employeeIds[i]);
+            // try-catch prevents full revert
+            try this.paySalary(employeeIds[i]) {} catch {}
         }
     }
 
-    function paySalary(uint _id) internal onlyOwnerOrSelf {
+    function paySalary(uint _id) external onlyOwnerOrSelf {
         require(_id < employees.length, "Invalid ID");
+
         Employee storage employee = employees[_id];
 
-        require(employee.isActive, "Employee inactive");
-        require(
-            block.timestamp - employee.lastPaymentDate >= 30 days,
-            "Not eligible yet"
-        );
+        if (
+            !employee.isActive ||
+            block.timestamp < employee.nextPaymentDate
+        ) {
+            return; // silently skip (important for automation)
+        }
 
         uint salaryEth = usdToEth(employee.salaryUSD);
         require(getContractBalance() >= salaryEth, "Insufficient funds");
 
         employee.lastPaymentDate = block.timestamp;
+        employee.nextPaymentDate += PAY_INTERVAL;
 
         (bool success, ) = payable(employee.walletAdd).call{value: salaryEth}(
             ""
@@ -191,7 +203,8 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         emit SalaryPaid(_id, employee.salaryUSD, salaryEth);
     }
 
-    // View functions
+    // ================= VIEW =================
+
     function getContractBalance() public view returns (uint) {
         return address(this).balance;
     }
@@ -200,16 +213,19 @@ contract Defisalary is Ownable, AutomationCompatibleInterface {
         return employees.length;
     }
 
-    // USD to ETH conversion functions
+    // ================= PRICE =================
+
     function getLatestETHPrice() public view returns (uint256) {
         (, int price, , , ) = priceFeed.latestRoundData();
-        require(price > 0, "Invalid price data");
-        return uint256(price) * 1e10; // Adjust precision to 18 decimal places. Chainlink price feeds return 8 decimal places
+        require(price > 0, "Invalid price");
+
+        return uint256(price) * 1e10; // 8 → 18 decimals
     }
 
     function usdToEth(uint _amountUSD) public view returns (uint) {
-        uint256 adjustedUsd = _amountUSD * (1e18); // adjusting to 18 decimal places
+        uint256 adjustedUsd = _amountUSD * 1e18;
         uint256 ethPrice = getLatestETHPrice();
-        return (adjustedUsd * 1e18) / ethPrice; // multiplying again with 1e18 to get eth amount in wei
+
+        return (adjustedUsd * 1e18) / ethPrice;
     }
 }
